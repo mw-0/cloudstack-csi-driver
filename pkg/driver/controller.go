@@ -69,7 +69,6 @@ func NewControllerServer(connector cloud.Interface) csi.ControllerServer {
 	}
 }
 
-//nolint:gocognit
 func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	logger := klog.FromContext(ctx)
 	logger.V(6).Info("CreateVolume: called", "args", *req)
@@ -148,51 +147,8 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	// If creating from snapshot, get the snapshot size
-	var snapshotSizeGiB int64
 	if snapshotID != "" {
-		logger.Info("Creating volume from snapshot", "snapshotID", snapshotID)
-		// Call the cloud connector's CreateVolumeFromSnapshot if implemented
-		printVolumeAsJSON(req)
-		snapshot, err := cs.connector.GetSnapshotByID(ctx, snapshotID)
-		if errors.Is(err, cloud.ErrNotFound) {
-			return nil, status.Errorf(codes.NotFound, "Snapshot %v not found", snapshotID)
-		} else if err != nil {
-			// Error with CloudStack
-			return nil, status.Errorf(codes.Internal, "Error %v", err)
-		}
-
-		logger.Info("PVC created with", "size", sizeInGB)
-		snapshotSizeGiB = util.RoundUpBytesToGB(snapshot.Size)
-		if snapshotSizeGiB > sizeInGB {
-			logger.Info("Snapshot size is greater than the request PVC, creating volume from snapshot of size", "snapshot size:", snapshotSizeGiB)
-			sizeInGB = snapshotSizeGiB
-		}
-
-		volFromSnapshot, err := cs.connector.CreateVolumeFromSnapshot(ctx, snapshot.ZoneID, name, snapshot.ProjectID, snapshotID, sizeInGB)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "Cannot create volume from snapshot %s: %v", snapshotID, err.Error())
-		}
-
-		// CloudStack creates the volume at the snapshot's size and ignores a larger
-		// requested size, so grow it here to satisfy the PVC request.
-		if growErr := cs.growVolumeFromSnapshot(ctx, volFromSnapshot, snapshotID, sizeInGB); growErr != nil {
-			return nil, growErr
-		}
-
-		resp := &csi.CreateVolumeResponse{
-			Volume: &csi.Volume{
-				VolumeId:      volFromSnapshot.ID,
-				CapacityBytes: volFromSnapshot.Size,
-				VolumeContext: req.GetParameters(),
-				ContentSource: req.GetVolumeContentSource(),
-				AccessibleTopology: []*csi.Topology{
-					Topology{ZoneID: volFromSnapshot.ZoneID}.ToCSI(),
-				},
-			},
-		}
-
-		return resp, nil
+		return cs.createVolumeFromSnapshot(ctx, req, name, snapshotID, sizeInGB)
 	}
 
 	// Determine zone using topology constraints.
@@ -289,6 +245,51 @@ func checkVolumeSuitable(vol *cloud.Volume,
 	}
 
 	return true, ""
+}
+
+// createVolumeFromSnapshot restores snapshotID into a new volume of at least sizeInGB.
+func (cs *controllerServer) createVolumeFromSnapshot(ctx context.Context, req *csi.CreateVolumeRequest, name, snapshotID string, sizeInGB int64) (*csi.CreateVolumeResponse, error) {
+	logger := klog.FromContext(ctx)
+	logger.Info("Creating volume from snapshot", "snapshotID", snapshotID)
+	printVolumeAsJSON(req)
+
+	snapshot, err := cs.connector.GetSnapshotByID(ctx, snapshotID)
+	if errors.Is(err, cloud.ErrNotFound) {
+		return nil, status.Errorf(codes.NotFound, "Snapshot %v not found", snapshotID)
+	} else if err != nil {
+		// Error with CloudStack
+		return nil, status.Errorf(codes.Internal, "Error %v", err)
+	}
+
+	logger.Info("PVC created with", "size", sizeInGB)
+	snapshotSizeGiB := util.RoundUpBytesToGB(snapshot.Size)
+	if snapshotSizeGiB > sizeInGB {
+		logger.Info("Snapshot size is greater than the request PVC, creating volume from snapshot of size", "snapshot size:", snapshotSizeGiB)
+		sizeInGB = snapshotSizeGiB
+	}
+
+	volFromSnapshot, err := cs.connector.CreateVolumeFromSnapshot(ctx, snapshot.ZoneID, name, snapshot.ProjectID, snapshotID, sizeInGB)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "Cannot create volume from snapshot %s: %v", snapshotID, err.Error())
+	}
+
+	// CloudStack creates the volume at the snapshot's size and ignores a larger
+	// requested size, so grow it here to satisfy the PVC request.
+	if growErr := cs.growVolumeFromSnapshot(ctx, volFromSnapshot, snapshotID, sizeInGB); growErr != nil {
+		return nil, growErr
+	}
+
+	return &csi.CreateVolumeResponse{
+		Volume: &csi.Volume{
+			VolumeId:      volFromSnapshot.ID,
+			CapacityBytes: volFromSnapshot.Size,
+			VolumeContext: req.GetParameters(),
+			ContentSource: req.GetVolumeContentSource(),
+			AccessibleTopology: []*csi.Topology{
+				Topology{ZoneID: volFromSnapshot.ZoneID}.ToCSI(),
+			},
+		},
+	}, nil
 }
 
 // growVolumeFromSnapshot resizes a volume created from a snapshot when it is
