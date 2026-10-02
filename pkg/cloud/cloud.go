@@ -83,6 +83,9 @@ type Snapshot struct {
 
 	VolumeID  string
 	CreatedAt string
+
+	// State is the CloudStack snapshot state, e.g. Creating, BackingUp, BackedUp.
+	State string
 }
 
 // VM represents a CloudStack Virtual Machine.

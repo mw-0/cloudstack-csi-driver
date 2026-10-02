@@ -46,6 +46,7 @@ func (c *client) GetSnapshotByID(ctx context.Context, snapshotID string) (*Snaps
 	return &Snapshot{
 		ID:        snapshot.Id,
 		Name:      snapshot.Name,
+		State:     snapshot.State,
 		Size:      snapshot.Virtualsize,
 		DomainID:  snapshot.Domainid,
 		ProjectID: snapshot.Projectid,
@@ -72,6 +73,7 @@ func (c *client) CreateSnapshot(ctx context.Context, volumeID, name string) (*Sn
 	return &Snapshot{
 		ID:        snapshot.Id,
 		Name:      snapshot.Name,
+		State:     snapshot.State,
 		Size:      snapshot.Virtualsize,
 		DomainID:  snapshot.Domainid,
 		ProjectID: snapshot.Projectid,
@@ -109,6 +111,7 @@ func (c *client) GetSnapshotByName(ctx context.Context, name string) (*Snapshot,
 	return &Snapshot{
 		ID:        snapshot.Id,
 		Name:      snapshot.Name,
+		State:     snapshot.State,
 		Size:      snapshot.Virtualsize,
 		DomainID:  snapshot.Domainid,
 		ProjectID: snapshot.Projectid,
@@ -151,6 +154,7 @@ func (c *client) ListSnapshots(ctx context.Context, volumeID, snapshotID string)
 		s := &Snapshot{
 			ID:        snapshot.Id,
 			Name:      snapshot.Name,
+			State:     snapshot.State,
 			Size:      snapshot.Virtualsize,
 			DomainID:  snapshot.Domainid,
 			ProjectID: snapshot.Projectid,

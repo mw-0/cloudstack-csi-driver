@@ -247,6 +247,19 @@ func checkVolumeSuitable(vol *cloud.Volume,
 	return true, ""
 }
 
+// isSnapshotReady reports whether a CloudStack snapshot can be used to restore a
+// volume. Snapshots still being created or backed up are not ready; the
+// snapshotter then calls CreateSnapshot again until they are. An empty state
+// (not reported) is treated as ready to keep the previous behavior.
+func isSnapshotReady(state string) bool {
+	switch state {
+	case "Allocated", "Creating", "CreatedOnPrimary", "BackingUp", "Copying":
+		return false
+	default:
+		return true
+	}
+}
+
 // createVolumeFromSnapshot restores snapshotID into a new volume of at least sizeInGB.
 func (cs *controllerServer) createVolumeFromSnapshot(ctx context.Context, req *csi.CreateVolumeRequest, name, snapshotID string, sizeInGB int64) (*csi.CreateVolumeResponse, error) {
 	logger := klog.FromContext(ctx)
@@ -407,6 +420,14 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 	}
 
 	klog.V(4).Infof("CreateSnapshot of volume: %s", volume.ID)
+
+	// Serialize calls for the same snapshot name. A timed-out call keeps running
+	// against CloudStack, so a retry must not race it and create a duplicate.
+	if acquired := cs.volumeLocks.TryAcquire(req.GetName()); !acquired {
+		return nil, status.Errorf(codes.Aborted, "An operation for snapshot %s is already in progress", req.GetName())
+	}
+	defer cs.volumeLocks.Release(req.GetName())
+
 	// CreateSnapshot must be idempotent (CSI spec): the snapshotter retries with
 	// the same name after timeouts, so return an existing snapshot instead of
 	// creating a duplicate in CloudStack.
@@ -426,6 +447,10 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 		}
 	default:
 		return nil, status.Errorf(codes.Internal, "Failed to look up snapshot %q: %v", req.GetName(), err)
+	}
+
+	if snapshot.State == "Error" {
+		return nil, status.Errorf(codes.Internal, "Snapshot %s of volume %s is in Error state in CloudStack", snapshot.ID, volume.ID)
 	}
 
 	t, err := time.Parse("2006-01-02T15:04:05-0700", snapshot.CreatedAt)
@@ -448,7 +473,7 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 			SourceVolumeId: volume.ID,
 			SizeBytes:      sizeBytes,
 			CreationTime:   ts,
-			ReadyToUse:     true,
+			ReadyToUse:     isSnapshotReady(snapshot.State),
 		},
 	}
 
@@ -492,7 +517,7 @@ func (cs *controllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnap
 				SourceVolumeId: snap.VolumeID,
 				SizeBytes:      snap.Size,
 				CreationTime:   ts,
-				ReadyToUse:     true,
+				ReadyToUse:     isSnapshotReady(snap.State),
 			},
 		}
 		entries = append(entries, entry)
