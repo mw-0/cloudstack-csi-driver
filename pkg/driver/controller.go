@@ -387,10 +387,18 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 
 	ts := timestamppb.New(t)
 
+	// Report the restore size so Kubernetes can show and enforce it.
+	// Fall back to the source volume size if CloudStack returns no virtualsize.
+	sizeBytes := snapshot.Size
+	if sizeBytes == 0 {
+		sizeBytes = volume.Size
+	}
+
 	resp := &csi.CreateSnapshotResponse{
 		Snapshot: &csi.Snapshot{
 			SnapshotId:     snapshot.ID,
 			SourceVolumeId: volume.ID,
+			SizeBytes:      sizeBytes,
 			CreationTime:   ts,
 			ReadyToUse:     true,
 		},
@@ -434,6 +442,7 @@ func (cs *controllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnap
 			Snapshot: &csi.Snapshot{
 				SnapshotId:     snap.ID,
 				SourceVolumeId: snap.VolumeID,
+				SizeBytes:      snap.Size,
 				CreationTime:   ts,
 				ReadyToUse:     true,
 			},
