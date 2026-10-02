@@ -174,6 +174,12 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			return nil, status.Errorf(codes.Internal, "Cannot create volume from snapshot %s: %v", snapshotID, err.Error())
 		}
 
+		// CloudStack creates the volume at the snapshot's size and ignores a larger
+		// requested size, so grow it here to satisfy the PVC request.
+		if growErr := cs.growVolumeFromSnapshot(ctx, volFromSnapshot, snapshotID, sizeInGB); growErr != nil {
+			return nil, growErr
+		}
+
 		resp := &csi.CreateVolumeResponse{
 			Volume: &csi.Volume{
 				VolumeId:      volFromSnapshot.ID,
@@ -283,6 +289,33 @@ func checkVolumeSuitable(vol *cloud.Volume,
 	}
 
 	return true, ""
+}
+
+// growVolumeFromSnapshot resizes a volume created from a snapshot when it is
+// smaller than the requested size. On failure the undersized volume is deleted
+// so the next CreateVolume retry starts clean.
+func (cs *controllerServer) growVolumeFromSnapshot(ctx context.Context, vol *cloud.Volume, snapshotID string, sizeInGB int64) error {
+	logger := klog.FromContext(ctx)
+
+	requiredBytes := util.GigaBytesToBytes(sizeInGB)
+	if vol.Size >= requiredBytes {
+		return nil
+	}
+
+	logger.Info("Volume from snapshot is smaller than requested, resizing",
+		"volumeID", vol.ID, "currentBytes", vol.Size, "requestedGB", sizeInGB)
+
+	if expandErr := cs.connector.ExpandVolume(ctx, vol.ID, sizeInGB); expandErr != nil {
+		if delErr := cs.connector.DeleteVolume(ctx, vol.ID); delErr != nil {
+			logger.Error(delErr, "Failed to delete undersized volume after resize failure", "volumeID", vol.ID)
+		}
+
+		return status.Errorf(codes.Internal, "Cannot resize volume %s created from snapshot %s to %d GB: %v",
+			vol.ID, snapshotID, sizeInGB, expandErr)
+	}
+	vol.Size = requiredBytes
+
+	return nil
 }
 
 func determineSize(req *csi.CreateVolumeRequest) (int64, error) {
