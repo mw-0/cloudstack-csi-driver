@@ -406,11 +406,25 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 	}
 
 	klog.V(4).Infof("CreateSnapshot of volume: %s", volume.ID)
-	snapshot, err := cs.connector.CreateSnapshot(ctx, volume.ID, req.GetName())
-	if errors.Is(err, cloud.ErrAlreadyExists) {
-		return nil, status.Errorf(codes.AlreadyExists, "Snapshot name conflict: already exists for a different source volume")
-	} else if err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to create snapshot for volume %s: %v", volume.ID, err.Error())
+	// CreateSnapshot must be idempotent (CSI spec): the snapshotter retries with
+	// the same name after timeouts, so return an existing snapshot instead of
+	// creating a duplicate in CloudStack.
+	snapshot, err := cs.connector.GetSnapshotByName(ctx, req.GetName())
+	switch {
+	case err == nil:
+		if snapshot.VolumeID != volume.ID {
+			return nil, status.Errorf(codes.AlreadyExists, "Snapshot %q already exists for a different source volume", req.GetName())
+		}
+		klog.V(4).Infof("CreateSnapshot: snapshot %s already exists for volume %s, returning it", snapshot.ID, volume.ID)
+	case errors.Is(err, cloud.ErrNotFound):
+		snapshot, err = cs.connector.CreateSnapshot(ctx, volume.ID, req.GetName())
+		if errors.Is(err, cloud.ErrAlreadyExists) {
+			return nil, status.Errorf(codes.AlreadyExists, "Snapshot name conflict: already exists for a different source volume")
+		} else if err != nil {
+			return nil, status.Errorf(codes.Internal, "Failed to create snapshot for volume %s: %v", volume.ID, err.Error())
+		}
+	default:
+		return nil, status.Errorf(codes.Internal, "Failed to look up snapshot %q: %v", req.GetName(), err)
 	}
 
 	t, err := time.Parse("2006-01-02T15:04:05-0700", snapshot.CreatedAt)
