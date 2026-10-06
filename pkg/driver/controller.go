@@ -103,40 +103,24 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 	defer cs.volumeLocks.Release(name)
 
-	// Check if a volume with that name already exists.
-	vol, err := cs.connector.GetVolumeByName(ctx, name)
-	if err != nil {
-		if !errors.Is(err, cloud.ErrNotFound) {
-			// Error with CloudStack
-			return nil, status.Errorf(codes.Internal, "CloudStack error: %v", err)
-		}
-	} else {
-		// The volume exists. Check if it suits the request.
-		if ok, message := checkVolumeSuitable(vol, diskOfferingID, req.GetCapacityRange(), req.GetAccessibilityRequirements()); !ok {
-			return nil, status.Errorf(codes.AlreadyExists, "Volume %v already exists but does not satisfy request: %s", name, message)
-		}
-		// Existing volume is ok.
-		resp := &csi.CreateVolumeResponse{
-			Volume: &csi.Volume{
-				VolumeId:      vol.ID,
-				CapacityBytes: vol.Size,
-				VolumeContext: req.GetParameters(),
-				// ContentSource: req.GetVolumeContentSource(), TODO: snapshot support.
-				AccessibleTopology: []*csi.Topology{
-					Topology{ZoneID: vol.ZoneID}.ToCSI(),
-				},
-			},
-		}
-
-		return resp, nil
-	}
-
 	// Check if this is a volume from snapshot
 	var snapshotID string
 	if src := req.GetVolumeContentSource(); src != nil {
 		if snap := src.GetSnapshot(); snap != nil {
 			snapshotID = snap.GetSnapshotId()
 		}
+	}
+
+	// Check if a volume with that name already exists, e.g. because an earlier
+	// attempt timed out after CloudStack had started creating it.
+	vol, err := cs.connector.GetVolumeByName(ctx, name)
+	switch {
+	case err == nil && snapshotID != "":
+		return cs.adoptRestoredVolume(ctx, req, vol, snapshotID)
+	case err == nil:
+		return existingVolumeResponse(req, vol, diskOfferingID)
+	case !errors.Is(err, cloud.ErrNotFound):
+		return nil, status.Errorf(codes.Internal, "CloudStack error: %v", err)
 	}
 
 	// We have to create the volume.
@@ -214,6 +198,25 @@ func printVolumeAsJSON(vol *csi.CreateVolumeRequest) {
 	klog.V(5).Infof("CreateVolumeRequest as JSON:\n%s", string(b))
 }
 
+// existingVolumeResponse returns an existing volume with the requested name if
+// it suits the request.
+func existingVolumeResponse(req *csi.CreateVolumeRequest, vol *cloud.Volume, diskOfferingID string) (*csi.CreateVolumeResponse, error) {
+	if ok, message := checkVolumeSuitable(vol, diskOfferingID, req.GetCapacityRange(), req.GetAccessibilityRequirements()); !ok {
+		return nil, status.Errorf(codes.AlreadyExists, "Volume %v already exists but does not satisfy request: %s", req.GetName(), message)
+	}
+
+	return &csi.CreateVolumeResponse{
+		Volume: &csi.Volume{
+			VolumeId:      vol.ID,
+			CapacityBytes: vol.Size,
+			VolumeContext: req.GetParameters(),
+			AccessibleTopology: []*csi.Topology{
+				Topology{ZoneID: vol.ZoneID}.ToCSI(),
+			},
+		},
+	}, nil
+}
+
 func checkVolumeSuitable(vol *cloud.Volume,
 	diskOfferingID string, capRange *csi.CapacityRange, topologyRequirement *csi.TopologyRequirement,
 ) (bool, string) {
@@ -281,6 +284,15 @@ func (cs *controllerServer) createVolumeFromSnapshot(ctx context.Context, req *c
 		sizeInGB = snapshotSizeGiB
 	}
 
+	// A restore larger than the snapshot needs a resize afterwards. Check the
+	// size against CloudStack's maximum first: otherwise the snapshot would be
+	// copied from secondary storage on every retry, only for the resize to fail.
+	if sizeInGB > snapshotSizeGiB {
+		if maxErr := cs.checkMaxCustomDiskSize(ctx, sizeInGB); maxErr != nil {
+			return nil, maxErr
+		}
+	}
+
 	volFromSnapshot, err := cs.connector.CreateVolumeFromSnapshot(ctx, snapshot.ZoneID, name, snapshot.ProjectID, snapshotID, sizeInGB)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Cannot create volume from snapshot %s: %v", snapshotID, err.Error())
@@ -292,17 +304,64 @@ func (cs *controllerServer) createVolumeFromSnapshot(ctx context.Context, req *c
 		return nil, growErr
 	}
 
+	return restoredVolumeResponse(req, volFromSnapshot), nil
+}
+
+// adoptRestoredVolume handles a CreateVolume retry for a restore whose volume
+// already exists from an earlier attempt, for example after the provisioner
+// timed out while CloudStack was still copying the snapshot. The volume keeps
+// the snapshot's disk offering, so only size and topology are checked, and the
+// content source is returned so the provisioner accepts the volume.
+func (cs *controllerServer) adoptRestoredVolume(ctx context.Context, req *csi.CreateVolumeRequest, vol *cloud.Volume, snapshotID string) (*csi.CreateVolumeResponse, error) {
+	logger := klog.FromContext(ctx)
+	logger.Info("Volume from snapshot already exists, reusing it", "volumeID", vol.ID, "snapshotID", snapshotID)
+
+	sizeInGB, err := determineSize(req)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	// An earlier attempt may have stopped before the volume was resized.
+	if growErr := cs.growVolumeFromSnapshot(ctx, vol, snapshotID, sizeInGB); growErr != nil {
+		return nil, growErr
+	}
+
+	if ok, message := checkVolumeSuitable(vol, vol.DiskOfferingID, req.GetCapacityRange(), req.GetAccessibilityRequirements()); !ok {
+		return nil, status.Errorf(codes.AlreadyExists, "Volume %v already exists but does not satisfy request: %s", req.GetName(), message)
+	}
+
+	return restoredVolumeResponse(req, vol), nil
+}
+
+// checkMaxCustomDiskSize returns OutOfRange if sizeInGB is above CloudStack's
+// maximum size for custom disk offerings. If the limit can't be read, the
+// request is allowed and CloudStack decides.
+func (cs *controllerServer) checkMaxCustomDiskSize(ctx context.Context, sizeInGB int64) error {
+	maxGB, err := cs.connector.GetMaxCustomDiskSizeGB(ctx)
+	if err != nil {
+		klog.FromContext(ctx).Error(err, "Cannot read CloudStack's maximum custom disk size; continuing")
+
+		return nil
+	}
+	if maxGB > 0 && sizeInGB > maxGB {
+		return status.Errorf(codes.OutOfRange, "Requested size %d GB is above CloudStack's maximum custom disk size of %d GB", sizeInGB, maxGB)
+	}
+
+	return nil
+}
+
+func restoredVolumeResponse(req *csi.CreateVolumeRequest, vol *cloud.Volume) *csi.CreateVolumeResponse {
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
-			VolumeId:      volFromSnapshot.ID,
-			CapacityBytes: volFromSnapshot.Size,
+			VolumeId:      vol.ID,
+			CapacityBytes: vol.Size,
 			VolumeContext: req.GetParameters(),
 			ContentSource: req.GetVolumeContentSource(),
 			AccessibleTopology: []*csi.Topology{
-				Topology{ZoneID: volFromSnapshot.ZoneID}.ToCSI(),
+				Topology{ZoneID: vol.ZoneID}.ToCSI(),
 			},
 		},
-	}, nil
+	}
 }
 
 // growVolumeFromSnapshot resizes a volume created from a snapshot when it is

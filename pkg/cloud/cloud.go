@@ -46,6 +46,10 @@ type Interface interface {
 	DetachVolume(ctx context.Context, volumeID string) error
 	ExpandVolume(ctx context.Context, volumeID string, newSizeInGB int64) error
 
+	// GetMaxCustomDiskSizeGB returns CloudStack's maximum size for volumes with
+	// a custom disk offering (0 if CloudStack reports no limit).
+	GetMaxCustomDiskSizeGB(ctx context.Context) (int64, error)
+
 	CreateVolumeFromSnapshot(ctx context.Context, zoneID, name, projectID, snapshotID string, sizeInGB int64) (*Volume, error)
 	GetSnapshotByID(ctx context.Context, snapshotID string) (*Snapshot, error)
 	GetSnapshotByName(ctx context.Context, name string) (*Snapshot, error)
