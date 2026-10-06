@@ -21,7 +21,6 @@ package cloud
 
 import (
 	"context"
-	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -86,24 +85,11 @@ func (c *client) CreateSnapshot(ctx context.Context, volumeID, name string) (*Sn
 func (c *client) DeleteSnapshot(_ context.Context, snapshotID string) error {
 	p := c.Snapshot.NewDeleteSnapshotParams(snapshotID)
 	_, err := c.Snapshot.DeleteSnapshot(p)
-	if isSnapshotGoneError(err) {
-		return ErrNotFound
-	}
 
+	// Errors are returned as they are. CloudStack reports an already deleted
+	// snapshot with several different messages, so the caller checks whether
+	// the snapshot still exists instead of matching error text.
 	return err
-}
-
-// isSnapshotGoneError reports whether a CloudStack deleteSnapshot error means
-// the snapshot no longer exists, so DeleteSnapshot can succeed idempotently.
-func isSnapshotGoneError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-
-	// 4350: InvalidParameterValueException, e.g. unknown snapshot ID.
-	// "already destroyed": snapshot was deleted earlier (errorcode 431).
-	return strings.Contains(msg, "4350") || strings.Contains(msg, "is already destroyed")
 }
 
 func (c *client) GetSnapshotByName(ctx context.Context, name string) (*Snapshot, error) {

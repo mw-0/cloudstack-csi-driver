@@ -388,11 +388,41 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	)
 
 	err := cs.connector.DeleteVolume(ctx, volumeID)
-	if err != nil && !errors.Is(err, cloud.ErrNotFound) {
-		return nil, status.Errorf(codes.Internal, "Cannot delete volume %s: %s", volumeID, err.Error())
+	if err == nil || errors.Is(err, cloud.ErrNotFound) {
+		return &csi.DeleteVolumeResponse{}, nil
 	}
 
-	return &csi.DeleteVolumeResponse{}, nil
+	// CloudStack uses the same error code for "no such volume" and for refusals
+	// such as "volume is attached". Only treat the delete as done if the volume
+	// is really gone; otherwise report why, so nothing is left behind unnoticed.
+	vol, getErr := cs.connector.GetVolumeByID(ctx, volumeID)
+	switch {
+	case errors.Is(getErr, cloud.ErrNotFound):
+		return &csi.DeleteVolumeResponse{}, nil
+	case getErr != nil:
+		return nil, status.Errorf(codes.Internal, "Cannot delete volume %s: %v (checking whether it still exists failed: %v)", volumeID, err, getErr)
+	case isVolumeDestroyed(vol.State):
+		logger.Info("Volume already destroyed in CloudStack; it will be expunged by CloudStack",
+			"volumeID", volumeID, "state", vol.State)
+
+		return &csi.DeleteVolumeResponse{}, nil
+	case vol.VirtualMachineID != "":
+		return nil, status.Errorf(codes.FailedPrecondition, "Cannot delete volume %s: it is attached to VM %s: %v",
+			volumeID, vol.VirtualMachineID, err)
+	default:
+		return nil, status.Errorf(codes.Internal, "Cannot delete volume %s: %v", volumeID, err)
+	}
+}
+
+// isVolumeDestroyed reports whether a CloudStack volume has been destroyed and
+// only waits for CloudStack to expunge it.
+func isVolumeDestroyed(state string) bool {
+	switch state {
+	case "Destroy", "Expunging", "Expunged":
+		return true
+	default:
+		return false
+	}
 }
 
 func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
@@ -536,14 +566,24 @@ func (cs *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteS
 	klog.V(4).Infof("DeleteSnapshot for snapshotID: %s", snapshotID)
 
 	err := cs.connector.DeleteSnapshot(ctx, snapshotID)
-	if errors.Is(err, cloud.ErrNotFound) {
+	if err == nil || errors.Is(err, cloud.ErrNotFound) {
 		// Per CSI spec, return OK if snapshot does not exist
 		return &csi.DeleteSnapshotResponse{}, nil
-	} else if err != nil {
-		return nil, status.Errorf(codes.Internal, "Error %v", err)
 	}
 
-	return &csi.DeleteSnapshotResponse{}, nil
+	// CloudStack reports an already deleted snapshot with several different
+	// messages. Treat the delete as done only if the snapshot is really gone.
+	snap, getErr := cs.connector.GetSnapshotByID(ctx, snapshotID)
+	switch {
+	case errors.Is(getErr, cloud.ErrNotFound):
+		return &csi.DeleteSnapshotResponse{}, nil
+	case getErr != nil:
+		return nil, status.Errorf(codes.Internal, "Cannot delete snapshot %s: %v (checking whether it still exists failed: %v)", snapshotID, err, getErr)
+	case snap.State == "Destroyed":
+		return &csi.DeleteSnapshotResponse{}, nil
+	default:
+		return nil, status.Errorf(codes.Internal, "Cannot delete snapshot %s (state %s): %v", snapshotID, snap.State, err)
+	}
 }
 
 func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {

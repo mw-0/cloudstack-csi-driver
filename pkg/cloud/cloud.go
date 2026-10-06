@@ -69,6 +69,9 @@ type Volume struct {
 
 	VirtualMachineID string
 	DeviceID         string
+
+	// State is the CloudStack volume state, e.g. Allocated, Ready, Destroy.
+	State string
 }
 
 // Snapshot represents a CloudStack snapshot.
